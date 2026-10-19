@@ -2,6 +2,8 @@
 
 This is a demo of a voice-powered snake game running on the ESP32-S3. The voice recognition model is powered by Mamba and is fully running on the MCU.
 
+The code to build the model is located at [https://github.com/fwsmit/mamba-embedded](https://github.com/fwsmit/mamba-embedded)
+
 ## Setup
 
 Python 3.10+ is required. The dashboard uses Tkinter, which is included with
