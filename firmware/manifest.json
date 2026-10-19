@@ -1,0 +1,25 @@
+{
+  "chip": "esp32s3",
+  "flash_mode": "dio",
+  "flash_freq": "80m",
+  "flash_size": "16MB",
+  "model": "demo.espdl",
+  "model_sha256": "5e1118c63de958757866e30330fea5ccb51a1dadc07e01dc8f764195c6083005",
+  "parts": [
+    {
+      "offset": "0x0",
+      "file": "bootloader.bin",
+      "sha256": "1f64af8f425d527ca0cdca29259e52214e8f240c2c6b4e58909f2b842cd5c0f0"
+    },
+    {
+      "offset": "0x8000",
+      "file": "partition-table.bin",
+      "sha256": "7268235b2d349650dd8f336bcbebf47a65dad83e67881f5f941114bd3784b0c3"
+    },
+    {
+      "offset": "0x10000",
+      "file": "mamba_inference.bin",
+      "sha256": "9aea8c1768b2eadee1c6f5063b64c9eaee2f37811ba539c9c3c145b9eee86fdf"
+    }
+  ]
+}

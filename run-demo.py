@@ -2,9 +2,10 @@
 """Monitor the I2S microphone demo app over serial and launch the snake game.
 
 By default this only opens the serial connection and streams the demo's
-output; no build or flash happens. With --flash it additionally copies the
-model (default: the bundled demo.espdl), builds the ESP-DL project with
-ACTIVE_APP=demo and flashes /dev/ttyACM0 before monitoring.
+output; no build or flash happens. With --flash it flashes the prebuilt
+firmware from firmware/ (matching the bundled demo.espdl) to /dev/ttyACM0,
+without requiring ESP-IDF. With --build it rebuilds the ESP-DL project with
+ACTIVE_APP=demo from source and flashes that instead (requires ESP-IDF).
 It opens a graphical window showing the live MCU information in a dashboard:
 the 24-sample waveform stamp, predicted keyword + confidence bar, RMS level
 meter, and rolling history plots of prediction, confidence, RMS and inference
@@ -13,14 +14,18 @@ Every newly guessed keyword (different from the previous guess) is published
 on a localhost TCP socket (see docs/word-socket.md), which the snake game
 launched alongside the dashboard connects to for voice control.
 
-Usage: run-demo.py [--flash] [--no-game] [-q] [--port N] [<path-to-model.espdl>]
-  --flash   build and flash before monitoring (default model: demo.espdl)
+Usage: run-demo.py [--flash|--build] [--no-game] [-q] [--port N]
+                   [<path-to-model.espdl>]
+  --flash   flash prebuilt firmware before monitoring (default model: demo.espdl)
+  --build   rebuild from source and flash (implies --flash; needs ESP-IDF)
   --no-game do not launch the snake game
   -q        quiet build/flash output (serial output is always streamed live)
   --port N  localhost TCP port for the keyword socket (default 8765)
 """
 
+import hashlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -51,6 +56,8 @@ ESP_DL_DIR = SCRIPT_DIR / "esp-dl"
 SNAKE_DIR = SCRIPT_DIR / "Python-Snake-Game"
 SNAKE_MAIN = SNAKE_DIR / "main.py"
 DEFAULT_MODEL = SCRIPT_DIR / "demo.espdl"
+FIRMWARE_DIR = SCRIPT_DIR / "firmware"
+FIRMWARE_MANIFEST = FIRMWARE_DIR / "manifest.json"
 IDF_ACTIVATE = Path.home() / ".espressif/tools/activate_idf_v6.0.1.sh"
 PORT = "/dev/ttyACM0"
 BAUD = 115200
@@ -126,9 +133,11 @@ class PILLabel(tk.Label):
 
 
 def usage(stream=sys.stderr):
-    print("Usage: run-demo.py [--flash] [--no-game] [-q] [--port N] "
+    print("Usage: run-demo.py [--flash|--build] [--no-game] [-q] [--port N] "
           "[<path-to-model.espdl>]", file=stream)
-    print("  --flash   build and flash before monitoring (default model: demo.espdl)",
+    print("  --flash   flash prebuilt firmware before monitoring "
+          "(default model: demo.espdl)", file=stream)
+    print("  --build   rebuild from source and flash (implies --flash; needs ESP-IDF)",
           file=stream)
     print("  --no-game do not launch the snake game", file=stream)
     print("  -q        quiet build/flash output (serial output is always streamed live)",
@@ -140,6 +149,7 @@ def usage(stream=sys.stderr):
 def parse_args(argv):
     quiet = False
     flash = False
+    build = False
     no_game = False
     port = WORD_SOCKET_PORT
     positionals = []
@@ -149,6 +159,9 @@ def parse_args(argv):
         if a == "-q":
             quiet = True
         elif a == "--flash":
+            flash = True
+        elif a == "--build":
+            build = True
             flash = True
         elif a == "--no-game":
             no_game = True
@@ -181,7 +194,7 @@ def parse_args(argv):
     model = positionals[0] if positionals else None
     if model is None and flash:
         model = str(DEFAULT_MODEL)
-    return quiet, flash, no_game, port, model
+    return quiet, flash, build, no_game, port, model
 
 
 def idf_env():
@@ -258,9 +271,32 @@ def stop_snake_game(proc):
         proc.wait()
 
 
+def stale_build_dir():
+    """Return the old project path if build/ was configured elsewhere."""
+    cache = ESP_DL_DIR / "build/CMakeCache.txt"
+    if not cache.is_file():
+        return None
+    try:
+        for line in cache.read_text(errors="replace").splitlines():
+            if line.startswith("CMAKE_HOME_DIRECTORY:INTERNAL="):
+                old = Path(line.split("=", 1)[1]).expanduser()
+                if old.resolve() != ESP_DL_DIR.resolve():
+                    return old
+    except OSError:
+        pass
+    return None
+
+
 def build_and_flash(env, quiet):
     idf = os.path.join(env["IDF_PATH"], "tools/idf.py")
     py = os.path.join(env["IDF_PYTHON_ENV_PATH"], "bin/python")
+    old_project = stale_build_dir()
+    if old_project is not None:
+        # Do not use `idf.py fullclean` here: it also removes the vendored
+        # managed_components/ directory, which may be the only local copy.
+        print(f"demo: build directory belongs to {old_project}; removing it",
+              file=sys.stderr)
+        shutil.rmtree(ESP_DL_DIR / "build", ignore_errors=True)
     common = [py, idf, "-D", "ACTIVE_APP=demo"]
     for step, extra in [("build", ["build"]),
                         ("flash", ["-p", PORT, "flash"])]:
@@ -272,6 +308,103 @@ def build_and_flash(env, quiet):
                         sys.stderr.write(line)
             print(f"demo: {step} failed (exit {rc})", file=sys.stderr)
             raise SystemExit(1)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def prebuilt_manifest(model_path):
+    """Return the firmware manifest if it matches model_path, else None."""
+    if not FIRMWARE_MANIFEST.is_file():
+        return None
+    try:
+        manifest = json.loads(FIRMWARE_MANIFEST.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"demo: cannot read prebuilt firmware manifest: {e}",
+              file=sys.stderr)
+        return None
+    required = ("chip", "flash_mode", "flash_freq", "flash_size", "parts")
+    if any(key not in manifest for key in required) or not manifest["parts"]:
+        print("demo: prebuilt firmware manifest is incomplete", file=sys.stderr)
+        return None
+    expected = manifest.get("model_sha256")
+    if expected and sha256_file(model_path) != expected:
+        return None
+    for part in manifest["parts"]:
+        if "offset" not in part or "file" not in part:
+            print("demo: prebuilt firmware manifest has an invalid part",
+                  file=sys.stderr)
+            return None
+        path = FIRMWARE_DIR / part["file"]
+        if not path.is_file():
+            print(f"demo: prebuilt firmware file is missing: {part['file']}",
+                  file=sys.stderr)
+            return None
+        expected_part = part.get("sha256")
+        if expected_part and sha256_file(path) != expected_part:
+            print(f"demo: prebuilt firmware file is corrupt: {part['file']}",
+                  file=sys.stderr)
+            return None
+    return manifest
+
+
+def esptool_python():
+    """Use esptool from this Python env, or fall back to the ESP-IDF env."""
+    if importlib.util.find_spec("esptool") is not None:
+        return sys.executable, None
+    if IDF_ACTIVATE.is_file():
+        env = idf_env()
+        py = Path(env["IDF_PYTHON_ENV_PATH"]) / "bin/python"
+        if py.is_file():
+            return str(py), env
+    print("Error: esptool is not installed. Install the Python requirements:\n"
+          "  python -m pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def esptool_is_v5_or_newer(py, env):
+    """esptool 5 uses hyphenated commands/options; 4.x uses underscores."""
+    rc, out = run_step(env, [py, "-m", "esptool", "version"], True,
+                       FIRMWARE_DIR)
+    if rc == 0:
+        match = re.search(r"esptool\s+v?(\d+)\.", "".join(out), re.IGNORECASE)
+        if match:
+            return int(match.group(1)) >= 5
+    return False
+
+
+def flash_prebuilt(manifest, quiet):
+    py, env = esptool_python()
+    modern = esptool_is_v5_or_newer(py, env)
+    parts = sorted(manifest["parts"], key=lambda p: int(p["offset"], 16))
+    args = [py, "-m", "esptool",
+            "--chip", manifest["chip"],
+            "-p", PORT,
+            "-b", "460800",
+            "--before", "default-reset" if modern else "default_reset",
+            "--after", "hard-reset" if modern else "hard_reset",
+            "write-flash" if modern else "write_flash",
+            "--flash-mode" if modern else "--flash_mode",
+            manifest["flash_mode"],
+            "--flash-freq" if modern else "--flash_freq",
+            manifest["flash_freq"],
+            "--flash-size" if modern else "--flash_size",
+            manifest["flash_size"]]
+    for part in parts:
+        args.extend([part["offset"], str(FIRMWARE_DIR / part["file"])])
+    rc, out = run_step(env, args, quiet, FIRMWARE_DIR)
+    if rc != 0:
+        if quiet:
+            for line in out:
+                if len(line) < 300:
+                    sys.stderr.write(line)
+        print(f"demo: flash failed (exit {rc})", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def prepare_model(model_path):
@@ -996,16 +1129,28 @@ def monitor_text_only(port):
 
 
 def main(argv):
-    quiet, flash, no_game, port, model = parse_args(argv)
+    quiet, flash, build, no_game, port, model = parse_args(argv)
     if flash:
-        prepare_model(model)
-        env = idf_env()
-        build_and_flash(env, quiet)
+        model_path = Path(model).expanduser()
+        if not model_path.is_file():
+            print(f"Error: model file not found: {model_path}", file=sys.stderr)
+            raise SystemExit(1)
+        manifest = None if build else prebuilt_manifest(model_path)
+        if manifest:
+            print("demo: flashing prebuilt firmware", file=sys.stderr)
+            flash_prebuilt(manifest, quiet)
+        else:
+            if not build:
+                print("demo: no matching prebuilt firmware; building from source",
+                      file=sys.stderr)
+            prepare_model(model_path)
+            env = idf_env()
+            build_and_flash(env, quiet)
         print("demo: flashed, monitoring serial output (Ctrl+C to stop)",
               file=sys.stderr)
     else:
         print("demo: monitoring serial output without flashing "
-              "(use --flash to build and flash first; Ctrl+C to stop)",
+              "(use --flash or --build to flash first; Ctrl+C to stop)",
               file=sys.stderr)
     word_server = WordServer(port)
     try:

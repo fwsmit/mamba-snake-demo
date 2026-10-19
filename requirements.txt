@@ -1,0 +1,7 @@
+# Python dependencies for the demo dashboard, serial monitor and snake game.
+pygame>=2.5.2
+pyserial>=3.5
+Pillow>=10.0
+
+# Flashing the prebuilt ESP firmware without installing ESP-IDF.
+esptool>=5.0

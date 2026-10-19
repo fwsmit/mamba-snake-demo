@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Unit tests for the snake game and on-device ESP-IDF tests.
+pytest>=8.0
+pytest-embedded>=1.10
+pytest-embedded-idf>=1.10
